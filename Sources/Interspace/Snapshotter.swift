@@ -12,7 +12,21 @@ struct Snapshot {
     /// False when the image stops below the Dock: it has no Dock, no menu bar and no island.
     /// The overlay must then be below the Dock too, so the real ones show on top of it.
     var includesDock = true
+    /// The notification banners that were on screen, which are not in `image`. For the transition that
+    /// starts now only: an image that is kept for later does not keep them. See `NotificationImage`.
+    var notifications: NotificationImage?
+}
 
+/// Notification banners, alerts or the Notification Center panel, cut out of the screen as it looked.
+///
+/// They stay where they are when the space changes, so they must not be in the image of a space: an image
+/// kept for later would show a banner that is long gone. The overlay is above them, so it draws them above
+/// the moving screens itself, and they do not go away during the transition.
+struct NotificationImage {
+    /// With transparency, and only what the banners add to the screen: their shadows have no desktop in them.
+    let image: CGImage
+    /// Where the image goes, in points from the top left of the screen.
+    let frame: CGRect
 }
 
 /// A snapshot that uses less memory: the same pixels, compressed with no loss. Use from any thread.
@@ -88,13 +102,22 @@ struct PackedSnapshot {
 /// - a capture of the screen rectangle has window shadows, but also the island around the camera;
 /// - a capture with a window filter can leave the island out, but has no window shadows.
 /// The first is the image. A small piece of the second covers the island.
+///
+/// When Notification Center shows something, the image is made from a list of windows instead, without
+/// its window: see `captureWithoutNotifications`.
 final class Snapshotter {
     /// The system process that draws the island, in a full-screen window above the menu bar.
     /// The island does not move with a space, so it must not be in the image of one.
     private static let islandOwnerBundleID = "com.apple.MenuBarAgent"
     private static let menuBarWindowLayer = 24
+    /// The system process that draws notification banners, alerts and the Notification Center panel, in a
+    /// window that covers the screen, above the Dock and below the menu bar (layer 21 on macOS 27). Its
+    /// widgets on the desktop, if any, are below the windows. See `NotificationImage`.
+    private static let notificationCenterBundleID = "com.apple.notificationcenterui"
 
     private var displays: [CGDirectDisplayID: SCDisplay] = [:]
+    /// System processes, by bundle identifier. See `processID(of:)`.
+    private var processes: [String: NSRunningApplication] = [:]
     private var islandWindows: [SCWindow] = []
     /// Windows of this app that are on screen (the overlay).
     private var ownWindows: [SCWindow] = []
@@ -194,6 +217,25 @@ final class Snapshotter {
         var screenImage: CGImage?
         var filteredImage: CGImage?
 
+        // At the same time as the captures below. Most of the time it only reads the window list. When it
+        // finds a banner, its image is the one: the others have the banner in them, and are not waited for.
+        if let notificationCenter = processID(of: Self.notificationCenterBundleID) {
+            let bounds = CGDisplayBounds(displayID)
+            let islandOwner = processID(of: Self.islandOwnerBundleID)
+            group.enter()
+            Self.captureQueue.async { [weak self] in
+                let result = Self.captureWithoutNotifications(bounds: bounds, notificationCenter: notificationCenter, islandOwner: islandOwner)
+                DispatchQueue.main.async {
+                    if let result {
+                        var snapshot = Snapshot(image: result.image)
+                        snapshot.notifications = result.notifications
+                        self?.finish(displayID, snapshot, number)
+                    }
+                    group.leave()
+                }
+            }
+        }
+
         var needsFiltered = true
         if #available(macOS 15.2, *) {
             needsFiltered = islandFrame != nil && !islandWindows.isEmpty
@@ -219,7 +261,8 @@ final class Snapshotter {
         }
 
         group.notify(queue: .main) { [weak self] in
-            guard let self else { return }
+            // Done already, without a notification banner.
+            guard let self, self.running[displayID] == number else { return }
             guard let image = screenImage ?? filteredImage else {
                 // The display and window lists can be stale after a display change.
                 self.displays[displayID] = nil
@@ -338,16 +381,16 @@ final class Snapshotter {
     private static let sampleHeight = 60
 
     /// A very small grey copy of the screen below one of our windows, to tell if the screen still changes.
-    /// It runs off the main thread, so the gesture stays responsive.
+    /// It runs off the main thread, so the gesture stays responsive. A notification banner is not in it:
+    /// one that slides in is not a change of the desktop, and must not keep the overlay up.
     func sampleBelow(windowNumber: Int, screen: NSScreen, completion: @escaping ([UInt8]?) -> Void) {
         let bounds = CGDisplayBounds(screen.displayID)
+        let notificationCenter = processID(of: Self.notificationCenterBundleID)
         Self.sampleQueue.async {
-            let onScreenBelowWindow: UInt32 = 1 << 2
-            let nominalResolution: UInt32 = 1 << 4
             var sample: [UInt8]?
             if windowNumber > 0,
-               let image = Self.windowListImage?(bounds, onScreenBelowWindow, UInt32(windowNumber), nominalResolution)?
-                   .takeRetainedValue() {
+               let image = Self.imageBelow(window: CGWindowID(windowNumber), bounds: bounds, options: Self.nominalResolution,
+                                           notificationCenter: notificationCenter) {
                 var pixels = [UInt8](repeating: 0, count: Self.sampleWidth * Self.sampleHeight)
                 let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
                     guard let context = CGContext(
@@ -389,16 +432,16 @@ final class Snapshotter {
         return Double(total) / Double(a.count) < 0.6 && changed * 400 < a.count
     }
 
-    /// Captures a screen as it is below one of our windows, while that window covers it.
-    /// Call `refreshDisplays` after the window is on screen and before this, so the window is known.
-    /// `includesDock` says if that window is above the Dock. If it is not, the image has no island to cover.
+    /// Captures a screen as it is below one of our windows, while that window covers it, without
+    /// notification banners. Call `refreshDisplays` after the window is on screen and before this, so the
+    /// window is known. `includesDock` says if that window is above the Dock. If it is not, the image has
+    /// no island to cover.
     func captureBelow(windowNumber: Int, screen: NSScreen, includesDock: Bool = true, completion: @escaping (Snapshot?) -> Void) {
         let displayID = screen.displayID
         let scale = screen.backingScaleFactor
-        let onScreenBelowWindow: UInt32 = 1 << 2
         guard windowNumber > 0,
-              let image = Self.windowListImage?(CGDisplayBounds(displayID), onScreenBelowWindow, UInt32(windowNumber), 0)?
-                  .takeRetainedValue()
+              let image = Self.imageBelow(window: CGWindowID(windowNumber), bounds: CGDisplayBounds(displayID), options: 0,
+                                          notificationCenter: processID(of: Self.notificationCenterBundleID))
         else {
             completion(nil)
             return
@@ -432,6 +475,210 @@ final class Snapshotter {
         for callback in callbacks {
             callback(snapshot)
         }
+    }
+
+    // MARK: - Without notification banners
+
+    /// The process with a bundle identifier, looked up again only when it has quit.
+    private func processID(of bundleID: String) -> pid_t? {
+        if let known = processes[bundleID], !known.isTerminated {
+            return known.processIdentifier
+        }
+        let found = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
+        processes[bundleID] = found
+        return found?.processIdentifier
+    }
+
+    private typealias WindowArrayImageFn = @convention(c) (CGRect, CFArray, UInt32) -> Unmanaged<CGImage>?
+
+    /// `CGWindowListCreateImageFromArray`, also not in the current SDK: the windows given, composited as on
+    /// screen, window shadows included. It is how a window can be left out of an image of the screen.
+    private static let windowArrayImage: WindowArrayImageFn? = {
+        guard let pointer = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImageFromArray") else { return nil }
+        return unsafeBitCast(pointer, to: WindowArrayImageFn.self)
+    }()
+
+    /// One pixel for each point.
+    private static let nominalResolution: UInt32 = 1 << 4
+
+    /// A window on screen, from the window list.
+    private struct ListedWindow {
+        let number: CGWindowID
+        let owner: pid_t
+        let layer: Int
+        let frame: CGRect
+    }
+
+    /// The windows on screen, front to back: all of them, or those below `window`.
+    private static func windowsOnScreen(below window: CGWindowID? = nil) -> [ListedWindow] {
+        let list: CFArray?
+        if let window {
+            list = CGWindowListCopyWindowInfo([.optionOnScreenBelowWindow], window)
+        } else {
+            list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+        }
+        return (list as? [[String: Any]] ?? []).compactMap { window in
+            guard let number = (window[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let owner = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            else { return nil }
+            let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+            let frame = (window[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) }
+            return ListedWindow(number: number, owner: owner, layer: layer, frame: frame ?? .null)
+        }
+    }
+
+    /// A window of Notification Center that is above the desktop: banners, alerts, its panel.
+    private static func isNotification(_ window: ListedWindow, notificationCenter: pid_t?) -> Bool {
+        window.owner == notificationCenter && window.layer > 0
+    }
+
+    /// The windows given, from front to back, in the part of the screen given.
+    private static func image(of windows: [ListedWindow], bounds: CGRect, options: UInt32 = 0) -> CGImage? {
+        guard let windowArrayImage, !windows.isEmpty else { return nil }
+        // The call takes the window numbers themselves, not CFNumbers.
+        var values = windows.map { UnsafeRawPointer(bitPattern: UInt($0.number)) }
+        guard let array = CFArrayCreate(nil, &values, values.count, nil) else { return nil }
+        return windowArrayImage(bounds, array, options)?.takeRetainedValue()
+    }
+
+    /// Everything on screen below one of our windows, without notification banners. Calls the window server.
+    private static func imageBelow(window: CGWindowID, bounds: CGRect, options: UInt32, notificationCenter: pid_t?) -> CGImage? {
+        if notificationCenter != nil {
+            let below = windowsOnScreen(below: window)
+            if below.contains(where: { isNotification($0, notificationCenter: notificationCenter) }) {
+                return image(of: below.filter { !isNotification($0, notificationCenter: notificationCenter) }, bounds: bounds, options: options)
+            }
+        }
+        let onScreenBelowWindow: UInt32 = 1 << 2
+        return windowListImage?(bounds, onScreenBelowWindow, window, options)?.takeRetainedValue()
+    }
+
+    /// What `captureWithoutNotifications` makes.
+    private struct CleanCapture {
+        let image: CGImage
+        let notifications: NotificationImage?
+    }
+
+    /// When Notification Center shows something on the display: the screen without it, and what it shows,
+    /// cut out of the screen as it looks. Nil when it shows nothing there, and when a capture fails: the
+    /// screen capture is then used. The island is left out too, as the patch does for the screen capture.
+    /// Calls the window server, so not on the main thread: about 70 ms with a banner, under 1 ms without.
+    private static func captureWithoutNotifications(bounds: CGRect, notificationCenter: pid_t, islandOwner: pid_t?) -> CleanCapture? {
+        let windows = windowsOnScreen().filter {
+            $0.frame.intersects(bounds) && !($0.owner == islandOwner && $0.layer > menuBarWindowLayer)
+        }
+        let notifications = windows.filter { isNotification($0, notificationCenter: notificationCenter) }
+        guard !notifications.isEmpty,
+              let clean = image(of: windows.filter { !isNotification($0, notificationCenter: notificationCenter) }, bounds: bounds)
+        else { return nil }
+        return CleanCapture(image: clean, notifications: cutOut(notifications, from: windows, clean: clean, bounds: bounds))
+    }
+
+    /// What the windows of Notification Center add to the screen. Three captures: those windows alone,
+    /// before and after, tell where they show something and how much of what is below still shows; the
+    /// screen as it looks, in between, gives the pixels. Nil when the windows show nothing, or when that
+    /// moved between the captures: a banner that slides in or out would be cut at the wrong place, and is
+    /// better left out until the transition is over.
+    private static func cutOut(_ notifications: [ListedWindow], from windows: [ListedWindow], clean: CGImage, bounds: CGRect) -> NotificationImage? {
+        guard let before = image(of: notifications, bounds: bounds, options: nominalResolution),
+              let box = visibleBox(of: before),
+              let shown = image(of: windows, bounds: bounds),
+              let after = image(of: notifications, bounds: bounds, options: nominalResolution),
+              visibleBox(of: after) == box,
+              shown.width == clean.width, shown.height == clean.height,
+              before.width > 0, bounds.width > 0
+        else { return nil }
+        // `box` is in the pixels of the nominal image, about one per point. The other images have the pixels
+        // of the display.
+        let points = CGFloat(before.width) / bounds.width
+        let scale = CGFloat(shown.width) / bounds.width
+        let frame = CGRect(x: box.minX / points, y: box.minY / points, width: box.width / points, height: box.height / points)
+        let pixels = CGRect(x: frame.minX * scale, y: frame.minY * scale, width: frame.width * scale, height: frame.height * scale)
+            .integral.intersection(CGRect(x: 0, y: 0, width: shown.width, height: shown.height))
+        guard !pixels.isEmpty,
+              let image = separate(shown: shown, clean: clean, coverage: before, coverageBox: box, pixels: pixels)
+        else { return nil }
+        return NotificationImage(
+            image: image,
+            frame: CGRect(x: pixels.minX / scale, y: pixels.minY / scale, width: pixels.width / scale, height: pixels.height / scale)
+        )
+    }
+
+    /// The smallest box around the pixels that are not fully transparent, in pixels from the top left.
+    private static func visibleBox(of image: CGImage) -> CGRect? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0,
+              // Only the alpha of each pixel. The colour space is not used.
+              let context = CGContext(
+                  data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
+                  space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue
+              ),
+              let data = context.data
+        else { return nil }
+        context.setBlendMode(.copy)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let alpha = data.assumingMemoryBound(to: UInt8.self)
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        // The first row in memory is the top of the image.
+        for y in 0..<height {
+            let row = alpha + y * width
+            for x in 0..<width where row[x] != 0 {
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// The banners alone, in `pixels` of the screen. On screen a pixel is the banner plus the part of the
+    /// desktop that still shows through it: `shown = banner + clean × (1 − coverage)`. So the banner is
+    /// `shown − clean × (1 − coverage)`, with `coverage` as its alpha. Its shadow then darkens whatever
+    /// screen is below it, with nothing of this desktop in it.
+    private static func separate(shown: CGImage, clean: CGImage, coverage: CGImage, coverageBox: CGRect, pixels: CGRect) -> CGImage? {
+        let width = Int(pixels.width)
+        let height = Int(pixels.height)
+        let colorSpace = shown.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.displayP3)
+        func bitmap() -> CGContext? {
+            guard let colorSpace else { return nil }
+            return CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        }
+        guard let shownPart = shown.cropping(to: pixels), let cleanPart = clean.cropping(to: pixels),
+              let coveragePart = coverage.cropping(to: coverageBox),
+              let result = bitmap(), let below = bitmap(), let cover = bitmap(),
+              let out = result.data?.assumingMemoryBound(to: UInt8.self),
+              let under = below.data?.assumingMemoryBound(to: UInt8.self),
+              let alpha = cover.data?.assumingMemoryBound(to: UInt8.self)
+        else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        for context in [result, below, cover] {
+            context.setBlendMode(.copy)
+        }
+        result.interpolationQuality = .none
+        result.draw(shownPart, in: rect)
+        below.interpolationQuality = .none
+        below.draw(cleanPart, in: rect)
+        // From points to pixels.
+        cover.interpolationQuality = .high
+        cover.draw(coveragePart, in: rect)
+
+        // Premultiplied, so no colour value can be above the alpha.
+        for index in stride(from: 0, to: width * height * 4, by: 4) {
+            let a = Int(alpha[index + 3])
+            let through = 255 - a
+            for channel in 0..<3 {
+                let value = Int(out[index + channel]) - (Int(under[index + channel]) * through + 127) / 255
+                out[index + channel] = UInt8(min(max(value, 0), a))
+            }
+            out[index + 3] = UInt8(a)
+        }
+        return result.makeImage()
     }
 
     /// The area that can hold the island, in points from the top left of the screen. Nil when the screen has no camera housing.

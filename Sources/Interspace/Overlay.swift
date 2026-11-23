@@ -121,6 +121,8 @@ final class Overlay {
     }
 
     private var loaderLayer: CALayer?
+    /// Notification banners that were on screen. They do not move with the screens. See `NotificationImage`.
+    private let notificationsLayer = CALayer()
 
     /// The transition to draw. Set it before `setCards`.
     var style = TransitionStyle.lightweight
@@ -166,6 +168,10 @@ final class Overlay {
         for card in cards {
             root.addSublayer(card.container)
         }
+        notificationsLayer.contentsGravity = .resize
+        notificationsLayer.zPosition = 5_000
+        notificationsLayer.isHidden = true
+        root.addSublayer(notificationsLayer)
     }
 
     private static func makePanel() -> NSPanel {
@@ -473,9 +479,30 @@ final class Overlay {
         loaderLayer = layer
     }
 
+    /// Draws notification banners above the screens, where they were on the display, or removes them with
+    /// `nil`. Call after `attach(to:)`. `hide()` removes them.
+    func showNotifications(_ notifications: NotificationImage?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let notifications {
+            // `frame` counts from the top of the screen, the layer from the bottom.
+            notificationsLayer.frame = CGRect(
+                x: notifications.frame.minX, y: size.height - notifications.frame.maxY,
+                width: notifications.frame.width, height: notifications.frame.height
+            )
+            notificationsLayer.contents = notifications.image
+            notificationsLayer.isHidden = false
+        } else {
+            notificationsLayer.contents = nil
+            notificationsLayer.isHidden = true
+        }
+        CATransaction.commit()
+    }
+
     func hide() {
         panel.orderOut(nil)
         showLoader(nil)
+        showNotifications(nil)
         // The alpha stays as it is. `present()` sets it, so a hidden window can never show at full alpha.
         isVisible = false
         // Release the screen-size images.

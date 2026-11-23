@@ -102,6 +102,9 @@ final class TransitionController {
     /// The image of the current space has no Dock in it, so the overlay goes below the real Dock.
     /// It comes from the capture and not from the setting: the capture can fail to leave the Dock out.
     private var overlayIsBelowDock = false
+    /// Notification banners that were on screen at the capture for this transition. The overlay draws them
+    /// where they were, above the moving screens. See `NotificationImage`.
+    private var notifications: NotificationImage?
 
     /// Full images, for the spaces near the current one. A space is in `cache` or in `packed`, not in both.
     private var cache: [UInt64: Snapshot] = [:]
@@ -741,6 +744,7 @@ final class TransitionController {
         captureToken += 1
         captureFinished = false
         captureFailed = false
+        notifications = nil
         layout = currentLayout()
         guard let layout else { return }
         setBase(layout.currentIndex)
@@ -760,6 +764,7 @@ final class TransitionController {
                 self.overlayIsBelowDock = !snapshot.includesDock
                 self.store(snapshot, for: spaceID)
             }
+            self.notifications = snapshot?.notifications
             self.captureFinished = true
             self.captureFailed = snapshot == nil
             self.captureDidFinish()
@@ -807,6 +812,9 @@ final class TransitionController {
     }
 
     private func store(_ snapshot: Snapshot, for spaceID: UInt64) {
+        var snapshot = snapshot
+        // They were on screen at the capture, and are not part of the space.
+        snapshot.notifications = nil
         cache[spaceID] = snapshot
         // The new image replaces the old one in each form.
         packed[spaceID] = nil
@@ -936,6 +944,7 @@ final class TransitionController {
         CATransaction.begin()
         overlay.attach(to: layout.screen)
         assignCards()
+        overlay.showNotifications(notifications)
         overlay.render(progress: progress)
         CATransaction.commit()
         overlay.present()
@@ -1337,6 +1346,7 @@ final class TransitionController {
         CATransaction.begin()
         overlay.attach(to: layout.screen)
         overlay.setCards { offset in offset == 0 ? .snapshot(cover) : .none }
+        overlay.showNotifications(cover.notifications)
         overlay.render(progress: 0)
         CATransaction.commit()
         overlay.present()
